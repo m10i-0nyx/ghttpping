@@ -19,6 +19,7 @@ class Sample:
     status: Optional[int]
     error: Optional[str]
     peer_ip: Optional[str] = None
+    http_version: Optional[str] = None
 
 
 async def probe_once(
@@ -33,15 +34,16 @@ async def probe_once(
         response = await client.request(method, url, headers=headers, timeout=timeout)
         await response.aread()
         elapsed_ms = (time.perf_counter() - start) * 1000
-        return Sample(latency_ms=elapsed_ms, status=response.status_code, error=None, peer_ip=None)
+        http_ver = getattr(response, "http_version", None)
+        return Sample(latency_ms=elapsed_ms, status=response.status_code, error=None, peer_ip=None, http_version=http_ver)
     except httpx.HTTPError as exc:
         elapsed_ms = (time.perf_counter() - start) * 1000
-        return Sample(latency_ms=elapsed_ms, status=None, error=str(exc), peer_ip=None)
+        return Sample(latency_ms=elapsed_ms, status=None, error=str(exc), peer_ip=None, http_version=None)
 
 
-async def fetch_public_ip(api_url: str, timeout: float = 3.0) -> Optional[str]:
+async def fetch_public_ip(api_url: str, timeout: float = 1.0) -> Optional[str]:
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(http2=True) as client:
             r = await client.get(api_url, timeout=timeout)
             r.raise_for_status()
             data = r.json()
@@ -56,19 +58,24 @@ async def probe(
     method: str,
     concurrency: int,
     ip_version: Optional[int] = None,
+    user_agent: Optional[str] = None,
 ) -> Sample:
-    effective_url = url
+    effective_url = url  # keep original host in URL to preserve SNI
     headers: Optional[Dict[str, str]] = None
     resolved_ip: Optional[str] = None
 
     parsed = urlsplit(url)
     host = parsed.hostname
     if host is None:
-        return Sample(latency_ms=None, status=None, error="invalid URL", peer_ip=None)
+        return Sample(latency_ms=None, status=None, error="invalid URL", peer_ip=None, http_version=None)
 
+    loop = asyncio.get_running_loop()
+
+    # Resolve an address for display / checking, but DO NOT replace URL (to keep SNI)
     if ip_version is not None:
         try:
             addr_obj = ipaddress.ip_address(host)
+            # host is a literal IP
             if (addr_obj.version == 4 and ip_version == 6) or (
                 addr_obj.version == 6 and ip_version == 4
             ):
@@ -77,27 +84,22 @@ async def probe(
                     status=None,
                     error=f"host is {addr_obj.version}, but -{ip_version} was requested",
                     peer_ip=None,
+                    http_version=None,
                 )
             resolved_ip = host
         except ValueError:
-            loop = asyncio.get_running_loop()
             family = socket.AF_INET if ip_version == 4 else socket.AF_INET6
-            port = parsed.port
-            if port is None:
-                port = 443 if parsed.scheme == "https" else 80
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
             try:
-                infos = await loop.getaddrinfo(
-                    host, str(port), family=family, type=socket.SOCK_STREAM
-                )
+                infos = await loop.getaddrinfo(host, str(port), family=family, type=socket.SOCK_STREAM)
                 if not infos:
-                    return Sample(latency_ms=None, status=None, error="no address found", peer_ip=None)
+                    return Sample(latency_ms=None, status=None, error="no address found", peer_ip=None, http_version=None)
                 resolved_ip = infos[0][4][0]
             except Exception as exc:
-                return Sample(latency_ms=None, status=None, error=str(exc), peer_ip=None)
-
+                return Sample(latency_ms=None, status=None, error=str(exc), peer_ip=None, http_version=None)
     else:
+        # best-effort resolution for display only
         try:
-            loop = asyncio.get_running_loop()
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
             infos = await loop.getaddrinfo(host, str(port), family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
             if infos:
@@ -105,41 +107,58 @@ async def probe(
         except Exception:
             resolved_ip = None
 
-    if resolved_ip is not None:
-        port = parsed.port
-        default_port = 443 if parsed.scheme == "https" else 80
-        include_port = port is not None and port != default_port
-        if ":" in resolved_ip:  # IPv6
-            host_literal = f"[{resolved_ip}]"
-        else:
-            host_literal = resolved_ip
-        netloc = host_literal + (f":{port}" if include_port else "")
-        effective_url = urlunsplit((parsed.scheme, netloc, parsed.path or "", parsed.query or "", parsed.fragment or ""))
-        original_host = (parsed.hostname or "")
-        original_host_header = original_host + (f":{port}" if include_port and port is not None else "")
-        headers = {"Host": original_host_header}
+    # Prepare headers (do not override Host header; URL host remains original)
+    headers = {}
+    if user_agent:
+        headers["User-Agent"] = user_agent
 
-    async with httpx.AsyncClient(http2=True) as client:
-        tasks = [
-            probe_once(client, effective_url, timeout, method, headers=headers)
-            for _ in range(concurrency)
-        ]
-        results = await asyncio.gather(*tasks)
+    # If ip_version is set, monkeypatch socket.getaddrinfo temporarily to force address family.
+    orig_getaddrinfo = None
+    if ip_version is not None:
+        orig_getaddrinfo = socket.getaddrinfo
+
+        desired_family = socket.AF_INET if ip_version == 4 else socket.AF_INET6
+
+        def patched_getaddrinfo(hostname, port, family=0, type=0, proto=0, flags=0):
+            # call original
+            results = orig_getaddrinfo(hostname, port, family, type, proto, flags)
+            # If caller asked AF_UNSPEC (0) or wants any, filter by desired_family
+            # If caller already requested specific family, keep its results.
+            if family == socket.AF_UNSPEC or family == 0:
+                filtered = [r for r in results if r[0] == desired_family]
+                return filtered
+            return results
+
+        socket.getaddrinfo = patched_getaddrinfo  # type: ignore
+
+    try:
+        async with httpx.AsyncClient(http2=True) as client:
+            tasks = [
+                probe_once(client, effective_url, timeout, method, headers=headers)
+                for _ in range(concurrency)
+            ]
+            results = await asyncio.gather(*tasks)
+    finally:
+        if orig_getaddrinfo is not None:
+            socket.getaddrinfo = orig_getaddrinfo  # restore
 
     ok_samples = [sample for sample in results if sample.status is not None]
     if ok_samples:
         average_latency = sum(sample.latency_ms or 0 for sample in ok_samples) / len(
             ok_samples
         )
+        # pick protocol from first successful response
+        http_ver = ok_samples[0].http_version
         return Sample(
             latency_ms=average_latency,
             status=ok_samples[0].status,
             error=None,
             peer_ip=resolved_ip,
+            http_version=http_ver,
         )
 
     first_error = next((sample.error for sample in results if sample.error), "unknown")
-    return Sample(latency_ms=None, status=None, error=first_error, peer_ip=resolved_ip)
+    return Sample(latency_ms=None, status=None, error=first_error, peer_ip=resolved_ip, http_version=None)
 
 
 def format_latency(latency_ms: Optional[float]) -> str:
@@ -189,15 +208,22 @@ def draw_screen(
     max_latency = max(ok_latencies) if ok_latencies else None  # type: ignore
 
     status_text = ""
+    protocol_text = ""
+    error_text = "-"
     if last is not None:
         if last.status is not None:
             status_text = f"HTTP {last.status}"
         else:
             status_text = "ERR"
+        protocol_text = last.http_version or "-"
+        if last.error:
+            error_text = last.error
+
     summary = (
         f"Interval: {interval:.1f}s | Concurrency: {concurrency} | "
-        f"Last: {format_latency(last.latency_ms) if last else '-'}"
+        f"Proto: {protocol_text} | Last: {format_latency(last.latency_ms) if last else '-'}"
         f" | Min: {format_latency(min_latency)} | Max: {format_latency(max_latency)} | {status_text}"
+        f" | Err: {error_text}"
     )
     screen.addnstr(3, 0, summary, cols - 1)
 
@@ -233,7 +259,7 @@ def draw_screen(
     screen.refresh()
 
 
-def run_monitor(url: str, interval: float, timeout: float, method: str, concurrency: int, ip_version: Optional[int]) -> None:
+def run_monitor(url: str, interval: float, timeout: float, method: str, concurrency: int, ip_version: Optional[int], user_agent: Optional[str]) -> None:
     samples: Deque[Sample] = deque(maxlen=500)
 
     def _loop(screen: "curses._CursesWindow") -> None:  # type: ignore
@@ -256,16 +282,16 @@ def run_monitor(url: str, interval: float, timeout: float, method: str, concurre
                 public_ips["v6"] = await fetch_public_ip("https://getipv6.0nyx.net/json")
                 while True:
                     try:
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(60)
                         public_ips["v4"] = await fetch_public_ip("https://getipv4.0nyx.net/json")
                         public_ips["v6"] = await fetch_public_ip("https://getipv6.0nyx.net/json")
                     except Exception:
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(60)
 
             asyncio.create_task(refresh_public_ips_loop())
 
             while True:
-                sample = await probe(url, timeout, method, concurrency, ip_version=ip_version)
+                sample = await probe(url, timeout, method, concurrency, ip_version=ip_version, user_agent=user_agent)
                 samples.append(sample)
                 draw_screen(screen, url, interval, concurrency, samples, public_ips)
                 await asyncio.sleep(interval)
@@ -308,6 +334,13 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Concurrent requests per interval (default: 1)",
     )
+    parser.add_argument(
+        "-U",
+        "--user-agent",
+        dest="user_agent",
+        default=None,
+        help="Set User-Agent header (default: httpx default)",
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "-4",
@@ -328,7 +361,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    run_monitor(args.url, args.interval, args.timeout, args.method, args.concurrency, args.ip_version)
+    run_monitor(args.url, args.interval, args.timeout, args.method, args.concurrency, args.ip_version, args.user_agent)
 
 
 if __name__ == "__main__":
