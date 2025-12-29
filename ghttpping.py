@@ -73,7 +73,7 @@ def color_for_status(status: int) -> int:
 
 
 def draw_screen(
-    screen: "curses._CursesWindow",
+    screen: "curses._CursesWindow", # type: ignore
     url: str,
     interval: float,
     concurrency: int,
@@ -88,8 +88,8 @@ def draw_screen(
 
     ok_latencies = [s.latency_ms for s in samples if s.status is not None]
     last = samples[-1] if samples else None
-    min_latency = min(ok_latencies) if ok_latencies else None
-    max_latency = max(ok_latencies) if ok_latencies else None
+    min_latency = min(ok_latencies) if ok_latencies else None # type: ignore
+    max_latency = max(ok_latencies) if ok_latencies else None # type: ignore
 
     status_text = ""
     if last is not None:
@@ -139,7 +139,7 @@ def draw_screen(
 def run_monitor(url: str, interval: float, timeout: float, method: str, concurrency: int) -> None:
     samples: Deque[Sample] = deque(maxlen=500)
 
-    def _loop(screen: "curses._CursesWindow") -> None:
+    def _loop(screen: "curses._CursesWindow") -> None: # type: ignore
         async def _async_loop() -> None:
             curses.curs_set(0)
             if curses.has_colors():
@@ -177,8 +177,8 @@ def parse_args() -> argparse.Namespace:
         "-t",
         "--timeout",
         type=float,
-        default=5.0,
-        help="Request timeout in seconds (default: 5.0)",
+        default=1.0,
+        help="Request timeout in seconds (default: 1.0)",
     )
     parser.add_argument(
         "-m",
