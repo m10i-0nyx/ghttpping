@@ -62,6 +62,16 @@ def format_latency(latency_ms: Optional[float]) -> str:
     return f"{latency_ms / 1000:6.2f} s"
 
 
+def color_for_status(status: int) -> int:
+    if 200 <= status < 300:
+        return 1
+    if 400 <= status < 500:
+        return 2
+    if 500 <= status < 600:
+        return 3
+    return 0
+
+
 def draw_screen(
     screen: "curses._CursesWindow",
     url: str,
@@ -113,11 +123,12 @@ def draw_screen(
             continue
         height = int((sample.latency_ms or 0) / max_scale * (graph_height - 1))
         height = max(height, 0)
+        bar_attr = curses.color_pair(color_for_status(sample.status))
         for offset in range(height + 1):
             y = rows - 2 - offset
             if y < graph_top:
                 break
-            screen.addch(y, x + 1, "█")
+            screen.addch(y, x + 1, "█", bar_attr)
 
     scale_label = f"max {format_latency(max_latency)}"
     screen.addnstr(graph_top - 1, 0, scale_label, cols - 1)
@@ -131,6 +142,13 @@ def run_monitor(url: str, interval: float, timeout: float, method: str, concurre
     def _loop(screen: "curses._CursesWindow") -> None:
         async def _async_loop() -> None:
             curses.curs_set(0)
+            if curses.has_colors():
+                curses.start_color()
+                curses.use_default_colors()
+                curses.init_pair(1, curses.COLOR_GREEN, -1)
+                curses.init_pair(2, curses.COLOR_YELLOW, -1)
+                curses.init_pair(3, curses.COLOR_RED, -1)
+
             screen.nodelay(True)
             while True:
                 sample = await probe(url, timeout, method, concurrency)
