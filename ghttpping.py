@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from typing import Deque, Optional, Dict
 import socket
 import ipaddress
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
+from datetime import datetime
 
 import httpx
 
@@ -120,10 +121,7 @@ async def probe(
         desired_family = socket.AF_INET if ip_version == 4 else socket.AF_INET6
 
         def patched_getaddrinfo(hostname, port, family=0, type=0, proto=0, flags=0):
-            # call original
             results = orig_getaddrinfo(hostname, port, family, type, proto, flags)
-            # If caller asked AF_UNSPEC (0) or wants any, filter by desired_family
-            # If caller already requested specific family, keep its results.
             if family == socket.AF_UNSPEC or family == 0:
                 filtered = [r for r in results if r[0] == desired_family]
                 return filtered
@@ -186,6 +184,7 @@ def draw_screen(
     concurrency: int,
     samples: Deque[Sample],
     public_ips: Dict[str, Optional[str]],
+    last_conn_time: Optional[str],
 ) -> None:
     screen.erase()
     rows, cols = screen.getmaxyx()
@@ -255,7 +254,15 @@ def draw_screen(
 
     scale_label = f"max {format_latency(max_latency)}"
     screen.addnstr(graph_top - 1, 0, scale_label, cols - 1)
+    # left message
     screen.addnstr(rows - 1, 0, "Press Ctrl+C to exit", cols - 1)
+    # right: last connection time
+    if last_conn_time:
+        rtxt = last_conn_time
+    else:
+        rtxt = "-"
+    col_pos = max(cols - len(rtxt) - 1, 0)
+    screen.addnstr(rows - 1, col_pos, rtxt, cols - col_pos - 1)
     screen.refresh()
 
 
@@ -275,6 +282,7 @@ def run_monitor(url: str, interval: float, timeout: float, method: str, concurre
             screen.nodelay(True)
 
             public_ips: Dict[str, Optional[str]] = {"v4": None, "v6": None}
+            last_conn_time: Optional[str] = None
 
             async def refresh_public_ips_loop() -> None:
                 # initial immediate fetch
@@ -293,7 +301,9 @@ def run_monitor(url: str, interval: float, timeout: float, method: str, concurre
             while True:
                 sample = await probe(url, timeout, method, concurrency, ip_version=ip_version, user_agent=user_agent)
                 samples.append(sample)
-                draw_screen(screen, url, interval, concurrency, samples, public_ips)
+                # update last connection time when probe completed
+                last_conn_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                draw_screen(screen, url, interval, concurrency, samples, public_ips, last_conn_time)
                 await asyncio.sleep(interval)
 
         asyncio.run(_async_loop())
