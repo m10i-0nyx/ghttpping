@@ -37,9 +37,15 @@ async def probe_once(
         elapsed_ms = (time.perf_counter() - start) * 1000
         http_ver = getattr(response, "http_version", None)
         return Sample(latency_ms=elapsed_ms, status=response.status_code, error=None, peer_ip=None, http_version=http_ver)
-    except httpx.HTTPError as exc:
+    except httpx.HTTPError as ex:
         elapsed_ms = (time.perf_counter() - start) * 1000
-        return Sample(latency_ms=elapsed_ms, status=None, error=str(exc), peer_ip=None, http_version=None)
+        if isinstance(ex, (httpx.TimeoutException,)):
+            err_msg = "Timeout"
+        elif isinstance(ex, asyncio.TimeoutError):
+            err_msg = "Timeout"
+        else:
+            err_msg = str(ex)
+        return Sample(latency_ms=elapsed_ms, status=None, error=err_msg, peer_ip=None, http_version=None)
 
 
 async def fetch_public_ip(api_url: str, timeout: float = 1.0) -> Optional[str]:
@@ -97,8 +103,8 @@ async def probe(
                 if not infos:
                     return Sample(latency_ms=None, status=None, error="no address found", peer_ip=None, http_version=None)
                 resolved_ip = infos[0][4][0]
-            except Exception as exc:
-                return Sample(latency_ms=None, status=None, error=str(exc), peer_ip=None, http_version=None)
+            except Exception as ex:
+                return Sample(latency_ms=None, status=None, error=str(ex), peer_ip=None, http_version=None)
     else:
         # best-effort resolution for display only
         try:
