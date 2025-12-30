@@ -60,6 +60,7 @@ async def probe(
     concurrency: int,
     ip_version: Optional[int] = None,
     user_agent: Optional[str] = None,
+    insecure: bool = False,
 ) -> Sample:
     effective_url = url  # keep original host in URL to preserve SNI
     headers: Optional[Dict[str, str]] = None
@@ -130,7 +131,7 @@ async def probe(
         socket.getaddrinfo = patched_getaddrinfo  # type: ignore
 
     try:
-        async with httpx.AsyncClient(http2=True) as client:
+        async with httpx.AsyncClient(http2=True, verify=not insecure) as client:
             tasks = [
                 probe_once(client, effective_url, timeout, method, headers=headers)
                 for _ in range(concurrency)
@@ -222,9 +223,11 @@ def draw_screen(
         f"Interval: {interval:.1f}s | Concurrency: {concurrency} | "
         f"Proto: {protocol_text} | Last: {format_latency(last.latency_ms) if last else '-'}"
         f" | Min: {format_latency(min_latency)} | Max: {format_latency(max_latency)} | {status_text}"
-        f" | Err: {error_text}"
     )
     screen.addnstr(3, 0, summary, cols - 1)
+
+    # show error on its own line
+    screen.addnstr(4, 0, f"Err: {error_text}", cols - 1)
 
     graph_top = 5
     graph_height = max(rows - graph_top - 1, 1)
@@ -253,7 +256,7 @@ def draw_screen(
             screen.addch(y, x + 1, "█", bar_attr)
 
     scale_label = f"max {format_latency(max_latency)}"
-    screen.addnstr(graph_top - 1, 0, scale_label, cols - 1)
+    screen.addnstr(graph_top, 0, scale_label, cols - 1)
     # left message
     screen.addnstr(rows - 1, 0, "Press Ctrl+C to exit", cols - 1)
     # right: last connection time
@@ -286,15 +289,13 @@ def run_monitor(url: str, interval: float, timeout: float, method: str, concurre
 
             async def refresh_public_ips_loop() -> None:
                 # initial immediate fetch
-                public_ips["v4"] = await fetch_public_ip("https://getipv4.0nyx.net/json")
-                public_ips["v6"] = await fetch_public_ip("https://getipv6.0nyx.net/json")
                 while True:
                     try:
-                        await asyncio.sleep(60)
                         public_ips["v4"] = await fetch_public_ip("https://getipv4.0nyx.net/json")
                         public_ips["v6"] = await fetch_public_ip("https://getipv6.0nyx.net/json")
+                        await asyncio.sleep(10)
                     except Exception:
-                        await asyncio.sleep(60)
+                        await asyncio.sleep(10)
 
             asyncio.create_task(refresh_public_ips_loop())
 
@@ -350,6 +351,12 @@ def parse_args() -> argparse.Namespace:
         dest="user_agent",
         default=None,
         help="Set User-Agent header (default: httpx default)",
+    )
+    parser.add_argument(
+        "-k",
+        "--insecure",
+        action="store_true",
+        help="Skip SSL certificate verification",
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
